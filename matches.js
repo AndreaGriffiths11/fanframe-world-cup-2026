@@ -32,12 +32,27 @@
     return res.json();
   }
 
+  function validData(data) {
+    return data && ["matches", "teams", "stadiums"].every(key =>
+      Array.isArray(data[key]) && data[key].every(item =>
+        item !== null && typeof item === "object" && !Array.isArray(item)));
+  }
+
+  function text(value, fallback = "") {
+    return typeof value === "string" ? value : fallback;
+  }
+
+  function score(value) {
+    return (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) ||
+      (typeof value === "string" && /^\d+$/.test(value)) ? String(value) : "?";
+  }
+
   function loadCache() {
     try {
       const raw = localStorage.getItem(CACHE_KEY);
       if (!raw) return null;
       const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed.savedAt !== "number") return null;
+      if (!validData(parsed) || !Number.isFinite(parsed.savedAt)) return null;
       if (Date.now() - parsed.savedAt > CACHE_TTL_MS * 4) return null; // hard cap 24h
       return parsed;
     } catch { return null; }
@@ -61,6 +76,7 @@
         fetchJson(STADIUMS_URL),
       ]);
       const payload = { matches, teams, stadiums };
+      if (!validData(payload)) throw new Error("Invalid schedule data");
       saveCache(payload);
       return payload;
     } catch (err) {
@@ -74,7 +90,7 @@
   // local time at the stadium. Without per-stadium TZ data we display the raw
   // kickoff time and label it "local" so we don't lie to the viewer.
   function parseKickoff(localDate) {
-    if (!localDate) return null;
+    if (typeof localDate !== "string") return null;
     const m = localDate.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(\d{2}):(\d{2})$/);
     if (!m) return null;
     const [, mm, dd, yyyy, hh, min] = m;
@@ -95,7 +111,7 @@
 
   function getTodayMatches({ matches }) {
     const today = todayKeyPT();
-    return matches.filter(m => (m.local_date || "").startsWith(today));
+    return matches.filter(m => text(m.local_date).startsWith(today));
   }
 
   function getUpcomingMatches({ matches }, limit = 3) {
@@ -112,11 +128,13 @@
   }
 
   function teamByMatchId(teams, id) {
-    return teams.find(t => String(t.id) === String(id));
+    if (typeof id !== "string" && typeof id !== "number") return null;
+    return teams.find(t => (typeof t.id === "string" || typeof t.id === "number") && String(t.id) === String(id));
   }
 
   function stadiumById(stadiums, id) {
-    return stadiums.find(s => String(s.id) === String(id));
+    if (typeof id !== "string" && typeof id !== "number") return null;
+    return stadiums.find(s => (typeof s.id === "string" || typeof s.id === "number") && String(s.id) === String(id));
   }
 
   // Look up the team in this project's TEAMS[] (defined in teams.js) by FIFA code.
@@ -141,56 +159,59 @@
     return team ? team.flag : "🏳️";
   }
 
+  // ponytail: Native DOM text/attribute setters keep feed data out of HTML parsing.
+  function element(tag, className, content = "") {
+    const node = document.createElement(tag);
+    node.className = className;
+    node.textContent = content;
+    return node;
+  }
+
   function buildMatchRow(match, data) {
     const homeSrc = teamByMatchId(data.teams, match.home_team_id);
     const awaySrc = teamByMatchId(data.teams, match.away_team_id);
-    const homeCode = homeSrc?.fifa_code || "?";
-    const awayCode = awaySrc?.fifa_code || "?";
     const stadium = stadiumById(data.stadiums, match.stadium_id);
-    const finished = String(match.finished).toUpperCase() === "TRUE";
-    const inProgress = !finished && match.time_elapsed && match.time_elapsed !== "notstarted";
+    const finished = match.finished === true || text(match.finished).toUpperCase() === "TRUE";
+    const elapsed = text(match.time_elapsed);
+    const inProgress = !finished && elapsed && elapsed !== "notstarted";
 
-    const homeName = homeSrc?.name_en || homeCode;
-    const awayName = awaySrc?.name_en || awayCode;
+    const row = element("div", "match-row");
+    const teams = element("div", "match-teams");
+    for (const [index, team] of [homeSrc, awaySrc].entries()) {
+      if (index) teams.append(element("span", "match-vs", "vs"));
+      const code = text(team?.fifa_code, "?") || "?";
+      const name = text(team?.name_en, code) || code;
+      const button = element("button", "match-team");
+      button.type = "button";
+      button.dataset.teamCode = code;
+      button.title = `Generate ${name} avatar`;
+      button.append(element("span", "match-flag", flagFor(code)), element("span", "match-code", code));
+      teams.append(button);
+    }
 
-    const scoreOrTime = finished || inProgress
-      ? `<span class="match-score">${match.home_score} – ${match.away_score}</span>`
-      : `<span class="match-time">${formatKickoff(match.local_date)}</span>`;
-
-    const statusBadge = finished
-      ? `<span class="match-status match-status-ft">FT</span>`
-      : inProgress
-        ? `<span class="match-status match-status-live">LIVE</span>`
-        : "";
+    const meta = element("div", "match-meta");
+    meta.append(finished || inProgress
+      ? element("span", "match-score", `${score(match.home_score)} – ${score(match.away_score)}`)
+      : element("span", "match-time", formatKickoff(match.local_date)));
+    if (finished || inProgress) {
+      meta.append(element("span", `match-status match-status-${finished ? "ft" : "live"}`, finished ? "FT" : "LIVE"));
+    }
 
     const groupLabel = match.type === "group"
-      ? `Group ${match.group}`
-      : (match.type || "").toUpperCase();
+      ? `Group ${text(match.group)}`
+      : text(match.type).toUpperCase();
+    const venue = stadium ? [text(stadium.name_en), text(stadium.city_en)].filter(Boolean).join(", ") : "";
+    const sub = element("div", "match-sub");
+    sub.append(element("span", "", groupLabel));
+    if (venue) sub.append(" · ", element("span", "", venue));
+    row.append(teams, meta, sub);
+    return row;
+  }
 
-    const venue = stadium ? `${stadium.name_en}, ${stadium.city_en}` : "";
-
-    return `
-      <div class="match-row">
-        <div class="match-teams">
-          <button class="match-team" data-team-code="${homeCode}" title="Generate ${homeName} avatar">
-            <span class="match-flag">${flagFor(homeCode)}</span>
-            <span class="match-code">${homeCode}</span>
-          </button>
-          <span class="match-vs">vs</span>
-          <button class="match-team" data-team-code="${awayCode}" title="Generate ${awayName} avatar">
-            <span class="match-flag">${flagFor(awayCode)}</span>
-            <span class="match-code">${awayCode}</span>
-          </button>
-        </div>
-        <div class="match-meta">
-          ${scoreOrTime}
-          ${statusBadge}
-        </div>
-        <div class="match-sub">
-          <span>${groupLabel}</span>${venue ? ` · <span>${venue}</span>` : ""}
-        </div>
-      </div>
-    `;
+  function header(label = "World Cup 2026") {
+    const node = element("div", "matches-header");
+    node.append(element("span", "matches-title", label));
+    return node;
   }
 
   function render(container, data) {
@@ -199,23 +220,13 @@
     const headerLabel = today.length > 0 ? "Today" : "Up next";
 
     if (list.length === 0) {
-      container.innerHTML = `
-        <div class="matches-header">
-          <span class="matches-title">World Cup 2026</span>
-        </div>
-        <p class="matches-empty">No upcoming matches.</p>
-        ${attribution()}
-      `;
+      container.replaceChildren(header(), element("p", "matches-empty", "No upcoming matches."), attribution());
       return;
     }
 
-    container.innerHTML = `
-      <div class="matches-header">
-        <span class="matches-title">${headerLabel} · World Cup 2026</span>
-      </div>
-      ${list.map(m => buildMatchRow(m, data)).join("")}
-      ${attribution()}
-    `;
+    container.replaceChildren(header(`${headerLabel} · World Cup 2026`));
+    list.forEach(match => container.append(buildMatchRow(match, data)));
+    container.append(attribution());
 
     // Wire click-to-prefill: pressing a team in the widget sets it in the
     // generator dropdown and focuses the username input.
@@ -239,23 +250,18 @@
   }
 
   function attribution() {
-    return `
-      <p class="matches-attribution">
-        Schedule data from
-        <a href="https://github.com/rezarahiminia/worldcup2026" target="_blank" rel="noopener">rezarahiminia/worldcup2026</a>
-      </p>
-    `;
+    const node = element("p", "matches-attribution", "Schedule data from ");
+    const link = element("a", "", "rezarahiminia/worldcup2026");
+    link.href = "https://github.com/rezarahiminia/worldcup2026";
+    link.target = "_blank";
+    link.rel = "noopener";
+    node.append(link);
+    return node;
   }
 
   function renderError(container, err) {
     console.warn("[fanframe] matches widget failed:", err);
-    container.innerHTML = `
-      <div class="matches-header">
-        <span class="matches-title">World Cup 2026</span>
-      </div>
-      <p class="matches-empty">Schedule unavailable right now.</p>
-      ${attribution()}
-    `;
+    container.replaceChildren(header(), element("p", "matches-empty", "Schedule unavailable right now."), attribution());
   }
 
   async function init() {
